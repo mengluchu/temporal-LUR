@@ -1,0 +1,410 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+```{r}
+ 
+ipak <- function(pkg){
+ 
+   new.pkg <- pkg[!(pkg %in% installed.packages()[, "Package"])]
+   if (length(new.pkg)) 
+    install.packages(new.pkg, dependencies = TRUE )
+  sapply(pkg, require, character.only = TRUE)
+}
+stdata = c("sp", "spacetime", "gstat", "leaps" ,"rgeos")
+ 
+tidy = c( "dplyr" , "reshape")
+others = c ("gsubfn", "rgdal")
+ 
+ 
+
+packages <- c(stdata, tidy,others )
+ipak(packages)
+
+```
+
+```{r, eval = T}
+# Select predictors in linear model using
+# - best subset selection
+# - Elastic Net ('pre-selection')
+# - best subset selection on Elastic net pre-selection
+# - calculate LOOCV
+# - Calculate prediction intervals
+
+# Load "NO2combi.RData" which contains NO2 data from 2000-2012 (response variable)
+# Load "stationscoordv2all.csv" which links predictors with response variable
+# Load ESCAPE predictors, see combineESCAPEpredictors.R
+# Ivan Soenario, 22 juni 2016, UU.
+
+# Also check LML-NO2-ESCAPE-predictorsv2.R for ESCAPE period (datums) and regsubset
+# Help on formula in lm(), https://rpubs.com/ppaquay/65559 search 'lm('
+
+# Visualisation of criteria (Cp, bic, adjr2):
+# http://rstudio-pubs-static.s3.amazonaws.com/4622_2395c464de00477584542e581068c791.html
+
+# Select predictor variables for the linear model,
+# using several methods. 1) E.Dons 2) Backward selection Cp 3) ...
+
+ 
+
+
+lmldir <- "C:/Users/Lu000012/Documents/files/GLOBAL_LUR/air pollution_Larken_and_utrecht/LUR_Utrecht/"
+preddir <- "C:/Users/Lu000012/Documents/files/GLOBAL_LUR/air pollution_Larken_and_utrecht/LUR_Utrecht/"
+NO2dir <-"C:/Users/Lu000012/Documents/files/GLOBAL_LUR/air pollution_Larken_and_utrecht/LUR_Utrecht/"
+imgdir <- "C:/Users/Lu000012/Documents/files/GLOBAL_LUR/air pollution_Larken_and_utrecht/LUR_Utrecht/"
+
+variablename = "NO2"
+### NO2 data ###
+load(paste(NO2dir, "NO2_2000_2012.RData", sep="")) # data.frame NO2
+
+
+### RIVM station info. Select only owner RIVM ###
+load(paste0(lmldir, "coordlml2015v2.RData"))
+stn <- stn[stn$owner=='RIVM',]
+stn$station <- as.character(stn$station)
+stn <- stn[order(stn$station),]
+rownames(stn) <- seq(length=nrow(stn)) # niet echt nodig, wel netjes
+
+
+### ESCAPE PREDICTOR VALUES AT STATION LOCATIONS (without HTL25h) ###
+# loads dataframe Epreds, and shorten/abbrevate the predictornames
+load(paste(preddir, "Epreds.RData", sep=""))
+predabbr <- list("major" = "mjr", "road" = "rd", "load"="ld", "heavy"="hvy", "length"="len",
+                 "industry" = "ind")
+prednames <- names(Epreds)
+prednamesnew <- gsubfn(paste(names(predabbr),collapse="|"),predabbr,prednames)
+names(Epreds) <- prednamesnew
+
+
+# Select stations in ESCAPE predictors that are in NO2 file
+NO2stn <- sort(names(NO2)[-1]) # Minus column 'datum'
+# NO2stn %in% stn$station # All NO2 stations are in station info file
+# stnsel <- stn$station %in% NO2stn
+NO2stn %in% Epreds$stn # All NO2 stations are in Predictors file
+Epreds$stn %in% NO2stn # indicate the predictor stations that are in NO2
+EPsel <- Epreds[Epreds$stn %in% NO2stn,]
+# identical(NO2stn, EPsel$stn) # check
+
+
+### Dummy variables ###
+HH <- as.integer(substr(NO2$datum,12,13))
+# unique(HH) ; table(HH) ; unique(table(HH))
+mn <- months(as.Date(substr(NO2$datum, 1, 10), format = "%d/%m/%Y"), abbreviate = T)
+mnt <- factor(mn, levels = c('jan', 'feb', 'mrt', 'apr', 'mei', 'jun', 'jul', 'aug', 'sep', 'okt', 'nov', 'dec'))
+# unique(mn) ; table(mn)
+wk <- weekdays(as.Date(substr(NO2$datum, 1, 10), format = "%d/%m/%Y"), abbreviate = T)
+wkf <- factor(x=wk, levels = c('ma', 'di', 'wo', 'do', 'vr', 'za', 'zo'))
+levels(wkf)[1:5] <- 'wkday'
+levels(wkf)[2:3] <- 'wkend'
+# barplot(table(wkf)) ; wkf[40:100]
+
+
+### SET TIME PERIOD ###
+# Expand ESCAPE period to five years
+# Middle of ESCAPE start and stop date is 31-12-2009
+ESdate <- seq(which(NO2$datum=="01/07/2006 01"), which(NO2$datum=="01/07/2011 24"))
+
+# Subset NO2 data
+NO2E <- NO2[ESdate,]
+
+# Delete any stations with NA only?
+NO2NAi <- sapply(NO2E, function(x) sum(!is.na(x))==0) # yep
+NO2Ev <- NO2E[,!NO2NAi]
+identical(names(NO2Ev),sort(names(NO2Ev)))
+
+
+### Remove stations that have less than 20% data ###
+NO2stnsumna <- sapply(NO2Ev[-1], function(x) 1-sum(is.na(x))/dim(NO2Ev)[1])
+delvars <- names(NO2Ev) %in% names(which(NO2stnsumna<0.2))
+NO2Ev <- NO2Ev[!delvars]
+
+
+### CALCULATE MEAN PER STATION FOR PREDICTOR SELECTION ###
+NO2Emean <- data.frame(stn=names(NO2Ev[-1]), NO2E=colMeans(NO2Ev[-1], na.rm = T),
+                       stringsAsFactors=FALSE)
+row.names(NO2Emean) <- 1:dim(NO2Emean)[1]
+
+
+### ADD DUMMY VARIABLES FOR COEFFICIENT CALCULATION ###
+# month, wkday/wkend, HOUR
+# Results for functions weekdays and months is LOCALE dependent
+NO2Ev$HH <- as.integer(substr(NO2Ev$datum,12,13))
+mn <- months(as.Date(substr(NO2Ev$datum, 1, 10), format = "%d/%m/%Y"), abbreviate = T)
+NO2Ev$M <- factor(mn, levels = c('jan', 'feb', 'mrt', 'apr', 'mei', 'jun', 'jul', 'aug', 'sep', 'okt', 'nov', 'dec'))
+wk <- weekdays(as.Date(substr(NO2Ev$datum, 1, 10), format = "%d/%m/%Y"), abbreviate = T)
+wkf <- factor(x=wk, levels = c('ma', 'di', 'wo', 'do', 'vr', 'za', 'zo'))
+levels(wkf)[1:5] <- 'wkday'
+levels(wkf)[2:3] <- 'wkend'
+NO2Ev$wk <- wkf
+
+
+### AGGREGATE AP CONCENTRATION PER DUMMY VARIABLE ###
+NO2Evm <- melt(NO2Ev[,-1], id=c('HH', 'wk', 'M'))
+NO2EaggrHwk <- aggregate(NO2Evm$value, by=list(NO2Evm$HH, NO2Evm$M ,NO2Evm$wk, NO2Evm$variable), FUN=mean, na.rm=T)
+names(NO2EaggrHwk) <- c('HH', 'M', 'wk', 'stn', 'NO2')
+# Onderstaande file maandnamen met nummers vervangen in Notepad++ !
+# write.csv(NO2EaggrHwk, file=paste0(lmldir, 'aggrmean-HWM-5yNO2.csv'), row.names=F, quote=F)
+NO2Eaggr <- NO2EaggrHwk
+names(stn)
+spNO2 = merge(NO2EaggrHwk, stn, by.x = "stn", by.y = "station") 
+ names(spNO2) 
+```
+
+```{r}
+ 
+#install.packages("visdat")
+#library(visdat)
+#pdf("missingvalues.pdf",width= 14, height=10,paper="a4r")
+  
+#vis_miss(sample_frac(NO2Ev%>%select(-HH, -M, -wk, -datum), 0.1)) 
+#dev.off()
+ 
+```
+stvariogram
+```{r}
+spvar = function(mon, wkd, cutoff=50000, width=5000 ) {
+s1sp = spNO2%>%filter(M== mon,wk==wkd, HH == "1")%>%dplyr::select(long,lat)
+coordinates(s1sp) = ~long + lat
+ proj4string(s1sp) = "+proj=longlat +datum=WGS84"
+s1sp =spTransform(s1sp, "+init=epsg:28992")
+s1 = spNO2%>%filter(M== mon,wk==wkd)
+#t1 = spNO2%>%filter(M== mon,wk=="wkday", adres == "Posterholt-Vlodropperweg")
+s1 = arrange(s1, HH, stn)   # rearrange so that sp goes faster
+st= STFDF(s1sp , as.POSIXct(seq(1*360, 24*3600, by =3600), origin = "2017-01-01"), data.frame(s1$NO2) )
+#stplot(st)
+v = variogramST(s1.NO2~1, data = st, tlags = 1:10, cutoff = cutoff, width = width )
+ 
+png(paste0("stva",mon, wkd, ".png"))
+print(plot(v, map = F))
+dev.off()
+}
+ 
+```
+
+
+```{r}
+ 
+mapply(spvar, mon=rep(c("jan","jun"), each =2), wkd= rep(c("wkday", "wkend"),2))
+
+getwd() 
+```
+
+map to the location
+```{r}
+s1sp = spNO2%>%filter(M== "jan",wk=="wkday", HH == "1")%>%dplyr::select(long,lat)
+coordinates(s1sp) = ~long + lat
+proj4string(s1sp) = "+proj=longlat +datum=WGS84"
+plot(s1sp)
+install.packages("tmap")
+library(tmap)
+osm_valuemean = tm_shape(s1sp) +
+  tm_dots()+ tm_view(basemaps = c('OpenStreetMap'))
+#+tm_shape(lnd)+tm_lines()
+
+tmap_save(osm_valuemean, "NL.html")
+ 
+
+s1sp =spTransform(s1sp, "+init=epsg:28992")
+jpeg("dis.png")
+hist(spDists(s1sp),20, freq = T, xlab = "Distance (m)", main = "paired distance", ylab= "number of pairs")
+dev.off()
+```
+
+```{r}
+a = spvar("jan", "wkday", cutoff= 50000, width = 3000) # 50km
+#plot(a, map =T, wireframe = T)
+plot(a, map =F, wireframe = F)
+a = spvar("apr", "wkday", cutoff = 50000, width = 3000)
+plot(a, map =F)
+
+a = spvar("jan", "wkend", cutoff= 50000, width = 3000) # 50km
+#plot(a, map =T, wireframe = T)
+plot(a, map =F, wireframe = F)
+a = spvar("apr", "wkend", cutoff = 50000, width = 3000)
+plot(a, map =F)
+ 
+```
+
+variogram for residuals
+```{r}
+load("C:/Users/Lu000012/Documents/files/GLOBAL_LUR/air pollution_Larken_and_utrecht/LUR_Utrecht/R-scripts/useful/inde_var.Rdata")
+
+resvario = function(M1, H1){
+j5 = NO2c%>%filter(M== M1,wk=="wkend", HH == H1)
+j5m = lm(NO2~1, data= j5)
+#hvy_traf_ld_50+mjr_rd_len_25+rd_len_1000+rd_len_5000
+summary(j5m)
+resj5sp = data.frame(cbind(residuals(j5m), x = unique(NO2c$x), y = unique(NO2c$y)) )
+coordinates(resj5sp) = c("x","y")
+ 
+v1 = variogram(V1~1, resj5sp, cutoff = 50000, width = 3000)
+jpeg(paste0("resvaend",M1, H1, ".png"))
+print(plot(v1))
+dev.off()
+}
+
+#install.packages("spdep")
+#library(spdep)
+#r.nb <- dnearneigh(resj5sp, d1=2000, d2=10000) 
+ 
+```
+```{r}
+mapply(resvario, M1=rep(c("jan","jun"), each =4), H1= rep(rep(c("5", "9", "14","18"),2)))
+mapply(resvario, M1=rep(c("jan" ), each =2), H1= rep(rep(c("5", "9"),2)))
+
+```
+
+```{r, eval =F}
+for( i in levels(spNO2$M)[1:2])
+  { 
+   v = spvar(i, "wkday")
+  plot(v, wireframe =T)
+ v = spvar(i, "wkend")
+   plot(v, wireframe =T)
+ }
+```
+
+spatial prediction
+```{r}
+
+dir = "C:/Users/Lu000012/Documents/files/trajectory/NO2_Input/"
+library(raster)
+
+hvy_traf_ld_50= raster (paste(dir, "heavy_traf_load50_Utreht.tif", sep= ""))
+mjr_rd_len_25= raster (paste(dir, "major_road_len25_Utreht.tif", sep= ""))
+rd_len_1000= raster(paste(dir, "road_len1000_Utreht.tif", sep= ""))
+rd_len_5000= raster(paste(dir, "roadlen5000_Utreht.tif", sep= ""))
+sr = stack(hvy_traf_ld_50,mjr_rd_len_25,rd_len_1000,rd_len_5000)
+names(sr)= c("hvy_traf_ld_50", "mjr_rd_len_25", "rd_len_1000", "rd_len_5000") 
+#install.packages("rasterVis")
+library(rasterVis)
+#levelplot(sr)
+lmpred = function(M1, HH1){
+j5 = NO2c%>%dplyr::filter(M==M1,wk=="wkday", HH == HH1)
+j5m = lm(NO2~hvy_traf_ld_50+mjr_rd_len_25+rd_len_1000+rd_len_5000, data= j5)
+#print(summary(j5m)) 
+predict(sr, j5m)
+}
+# l = mapply( lmpred, M1=c("jan","jan","jan","jan","jun","jun","jun","jun"), HH1= c("5", "9", "14","18","5", "9", "14","18"))
+l = mapply(lmpred, M1=rep(c("jan","jun"), each =4), HH1= rep(c("5", "9", "14","18"),2))
+sre = stack(l)  
+#meansr  = calc(sre, median)
+```
+
+SD of the 8 plots
+```{r}
+#sdp = calc(sre,sd)
+ 
+#writeRaster(sdp,"C:/Users/Lu000012/Documents/files/GLOBAL_LUR/air pollution_Larken_and_utrecht/LUR_Utrecht/sdp.tiff")
+
+
+levelplot(sdp)
+
+ l = mapply( lmpred, M1=rep(c("jan","apr","jul","okt"), each =4), HH1= rep(c("5", "9", "14","18"),4))
+ 
+sre = stack(l) 
+sdp = calc(sre,sd)
+myTheme <- rasterTheme(region = c(colorRamps::matlab.like2(n = 10)))
+#brewer.pal(4, "Greys"), 
+myColorkey <- list(at=seq(0, 24, by =3), ## where the colors change
+                   labels=list(
+                     at=seq(0, 24, by =3) ## where to print labels
+                     ))
+pdf("C:/Users/Lu000012/Documents/files/submit_AE/sd16.pdf")
+levelplot(sdp,par.setting = myTheme, colorkey = myColorkey)
+ dev.off()
+```
+
+```{r}
+rmse <- function(test, pred) {
+         sqrt(mean((pred - test)^2))
+}
+
+ 
+ 
+comhbrmse = function(M1, HH1, h = 0.1)
+{
+  hrmse = c()  
+srmse = c()
+j5 = NO2c%>%dplyr::filter(M==M1,wk=="wkday", HH == HH1)
+nob = nrow(j5)
+om = round(nob*h)
+
+for (i in (1+om):(nob-om)){
+train = j5[-((i-om):(i+om)),] 
+train2 = j5[-i,]
+test = j5[i,]
+mod1 = lm(NO2~hvy_traf_ld_50+mjr_rd_len_25+rd_len_1000+rd_len_5000, data= train )
+mod2 = lm(NO2~hvy_traf_ld_50+mjr_rd_len_25+rd_len_1000+rd_len_5000, data= train2)
+
+pred1 = predict(mod1, newdata = test)
+pred2 = predict(mod2, newdata = test)
+ 
+hrmse[i-om] = rmse(test$NO2, pred = pred1)
+srmse[i-om] = rmse(test$NO2, pred = pred2)
+
+}
+list(hblock =mean(hrmse), LOOCV = mean(srmse))
+}
+
+
+names1 = paste(rep(c("Jan.","Apr.","Jul.","Oct."), each =4), rep(c("05:00", "09:00", "14:00","18:00"),4), sep = "  ")
+l = mapply(comhbrmse,   M1=rep(c("jan","apr","jul","okt"), each =4), HH1= rep(c("5", "9", "14","18"),4), h=0.2,SIMPLIFY = T )
+
+l2 = mapply(comhbrmse,   M1=rep(c("jan","apr","jul","okt"), each =4), HH1= rep(c("5", "9", "14","18"),4), h=0.15,SIMPLIFY = T )
+ l3 = mapply(comhbrmse,   M1=rep(c("jan","apr","jul","okt"), each =4), HH1= rep(c("5", "9", "14","18"),4), h=0.1,SIMPLIFY = T )
+  l4 = mapply(comhbrmse,   M1=rep(c("jan","apr","jul","okt"), each =4), HH1= rep(c("5", "9", "14","18"),4), h=0.05,SIMPLIFY = T )
+    l5 = mapply(comhbrmse,   M1=rep(c("jan","apr","jul","okt"), each =4), HH1= rep(c("5", "9", "14","18"),4), h=0.0,SIMPLIFY = T )
+
+df=rbind(data.frame(l5[2,]), data.frame(l4[1,]), data.frame(l3[1,]),data.frame(l2[1,]),data.frame(l[1,]))
+ 
+names(df) = names1
+ 
+rownames(df)= c("LOOCV", "h=0.05","h=0.1","h=0.15","h=0.2") 
+install.packages("stargazer")  
+library(stargazer)
+stargazer(t(df))
+```
+
+
+```{r}
+#s= seq(0.1, 0.9, by = 0.1) 
+#q = quantile(sre,s)
+#my.at = apply(q,2, median)
+ my.at = c(seq(0, 70, by =10), 139)
+library(RColorBrewer)
+library(colorRamps)
+
+myTheme <- rasterTheme(region = c(colorRamps::matlab.like2(n = 10)))
+#brewer.pal(4, "Greys"), 
+myColorkey <- list(at=my.at, ## where the colors change
+                   labels=list(
+                     at=c(seq(0, 70, by =10), 138) ## where to print labels
+                     ))
+pdf("C:/Users/Lu000012/Documents/files/submit_AE/predictionJanJune.pdf")
+levelplot(sre,at = my.at, par.setting = myTheme, colorkey = myColorkey)
+ dev.off()
+```
+
+print Rsquared
+```{r}
+rsqe = function(M1, HH1){
+j5 = NO2c%>%dplyr::filter(M==M1,wk=="wkday", HH == HH1)
+  
+ j5m = lm(NO2~hvy_traf_ld_50+mjr_rd_len_25+rd_len_1000+rd_len_5000, data= j5)
+summary(j5m)$adj.r.squared
+}
+j5 = NO2c%>%dplyr::filter(M=="jan"
+                    ,wk=="wkday", HH == 1)
+ summary(lm(NO2~hvy_traf_ld_50+mjr_rd_len_25+rd_len_1000+rd_len_5000, data= j5))$r.squared
+ rsqe("jan", "1")
+```
+```{r}
+library(dplyr)
+j5 = NO2c%>%filter(stn== "NL10107")
+plot(j5$NO2 )
+head(j5, 30)
+```
+
